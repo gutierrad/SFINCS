@@ -164,8 +164,21 @@ module sfincs_ncoutput
    !     Called from: write_output (sfincs_output)
    !
    !   ncoutput_update_max(t, ntmaxout)
-   !     Write the maximum-value fields to the map file.
+   !     Write the maximum-value fields to the map file: at timemax index ntmaxout, or
+   !     (storemaxontime = 1) to all map records of the window that ends at t.
    !     Called from: write_output (sfincs_output)
+   !
+   !   ncoutput_write_max_records(t, nt, nrec)
+   !     Write the maximum-value fields to nrec records starting at nt.
+   !     Called from: ncoutput_update_max (sfincs_ncoutput)
+   !
+   !   ncoutput_write_cumulative(nt)
+   !     Write the cumulative precipitation, infiltration and urban drainage fields.
+   !     Called from: ncoutput_update_map, ncoutput_write_max_records (sfincs_ncoutput)
+   !
+   !   ncoutput_fill_last_max_records()
+   !     Copy the last window maximum to the map records after the last window (storemaxontime).
+   !     Called from: ncoutput_map_finalize (sfincs_ncoutput)
    !
    !   ncoutput_map_finalize()
    !     Write the run statistics to the map file and close it.
@@ -232,6 +245,7 @@ contains
    implicit none
    !
    integer :: nm, nmq, n, m, ntmx, nn, n_nodes, n_faces, iref
+   integer :: nrec_window, nt_chunk, nt_chunk_max, ncells
    real*4  :: dxx, dyy
    !
    ! sp_dimids is local scratch; nsd/dims_*/coord_str are module-level in
@@ -334,8 +348,14 @@ contains
    endif
    !
    NF90(nf90_def_dim(map_file%ncid, 'time',    NF90_UNLIMITED, map_file%time_dimid))
-   ntmx = max(ceiling((t1out - t0out)/dtmaxout), 1)
-   NF90(nf90_def_dim(map_file%ncid, 'timemax', ntmx, map_file%timemax_dimid))
+   !
+   if (.not. store_max_on_time) then
+      !
+      ntmx = max(ceiling((t1out - t0out)/dtmaxout), 1)
+      NF90(nf90_def_dim(map_file%ncid, 'timemax', ntmx, map_file%timemax_dimid))
+      !
+   endif
+   !
    NF90(nf90_def_dim(map_file%ncid, 'runtime', 1,    map_file%runtime_dimid))
    !
    if (store_vegetation) then
@@ -346,6 +366,64 @@ contains
    dims_s (1:nsd)   = sp_dimids(1:nsd)
    dims_st(1:nsd)   = sp_dimids(1:nsd);  dims_st(nsd+1) = map_file%time_dimid
    dims_sm(1:nsd)   = sp_dimids(1:nsd);  dims_sm(nsd+1) = map_file%timemax_dimid
+   !
+   if (store_max_on_time) then
+      !
+      ! Max output on the map time axis. Each map record gets the maximum of the dtmaxout
+      ! window that contains it, so a window maximum is repeated in all records of its
+      ! window. A chunk holds a part of one window (all its records x a small spatial
+      ! block of ~8 kB per record), so that deflate compresses the identical copies
+      ! together. Chunks must not straddle two windows: the depth along time divides the
+      ! number of records per window, and is limited to keep the write buffer small.
+      !
+      dims_sm(nsd+1) = map_file%time_dimid
+      !
+      if (use_quadtree) then
+         !
+         chunk_sm(1) = min(n_faces, 2048)
+         ncells      = n_faces
+         !
+      else
+         !
+         chunk_sm(1) = min(mmax, 2048)
+         chunk_sm(2) = max(1, min(nmax, 2048 / mmax))
+         ncells      = mmax * nmax
+         !
+      endif
+      !
+      nt_chunk_max = max(1, min(24, 16000000 / ncells))
+      !
+      if (dtmaxout >= t1out - t0out) then
+         !
+         ! One window for the whole simulation
+         !
+         nt_chunk = min(floor((t1out - t0out) / dtmapout) + 1, nt_chunk_max)
+         !
+      else
+         !
+         nrec_window = nint(dtmaxout / dtmapout)
+         nt_chunk    = 1
+         !
+         if (nrec_window >= 1 .and. abs(nrec_window * dtmapout - dtmaxout) < 1.0e-3 * dtmapout) then
+            !
+            do nt_chunk = min(nrec_window, nt_chunk_max), 1, -1
+               !
+               if (mod(nrec_window, nt_chunk) == 0) exit
+               !
+            enddo
+            !
+         else
+            !
+            call write_log('Warning : dtmaxout is not a multiple of dtmapout, max output on time is not compressed per window', 1)
+            !
+         endif
+         !
+      endif
+      !
+      chunk_sm(nsd+1)    = nt_chunk
+      t_max_window_start = t0out
+      !
+   endif
    !
    ! Global metadata
    ! CF version unified at 1.8 across both grid types and the his file.
@@ -581,11 +659,26 @@ contains
    ! -------------------------------------------------------
    ! Max-output time variable
    ! -------------------------------------------------------
-   if (store_maximum_waterlevel) then
+   if (store_maximum_waterlevel .and. .not. store_max_on_time) then
       NF90(nf90_def_var(map_file%ncid, 'timemax', NF90_FLOAT, (/map_file%timemax_dimid/), map_file%timemax_varid))
       NF90(nf90_put_att(map_file%ncid, map_file%timemax_varid, 'units',     'seconds since ' // trim(trefstr_iso8601)))
       NF90(nf90_put_att(map_file%ncid, map_file%timemax_varid, 'standard_name', 'time'))
       NF90(nf90_put_att(map_file%ncid, map_file%timemax_varid, 'long_name', 'time_in_seconds_since_' // trim(trefstr_iso8601)))
+   endif
+   !
+   if (store_max_on_time) then
+      !
+      ! Start and end of the dtmaxout window that each map record belongs to
+      !
+      call ncdef_float_var(map_file%ncid, 'max_window_start', (/map_file%time_dimid/), map_file%max_window_start_varid, &
+           'seconds since ' // trim(trefstr_iso8601), 'start of the dtmaxout window of the maximum output',              &
+           description='The maximum output at each map time is the maximum over [max_window_start, max_window_end]')
+      call ncdef_float_var(map_file%ncid, 'max_window_end', (/map_file%time_dimid/), map_file%max_window_end_varid,     &
+           'seconds since ' // trim(trefstr_iso8601), 'end of the dtmaxout window of the maximum output',                &
+           description='The maximum output at each map time is the maximum over [max_window_start, max_window_end]')
+      !
+      NF90(nf90_put_att(map_file%ncid, nf90_global, 'max_output', 'maximum over the dtmaxout window containing each map time'))
+      !
    endif
    !
    if (store_maximum_waterlevel) then
@@ -598,7 +691,13 @@ contains
            standard_name='maximum_subgrid_volume_in_cell')
    endif
    !
-   if (store_cumulative_precipitation) then
+   if (store_cumulative_precipitation .and. store_max_on_time) then
+      !
+      ! Cumulative since the start of the simulation, so with storemaxontime a normal map variable
+      !
+      call def_time_cell_float('cumprcp', map_file%cumprcp_varid, 'm', 'Cumulative precipitation depth', &
+           standard_name='cumulative_precipitation_depth', cell_methods='time: sum')
+   elseif (store_cumulative_precipitation) then
       call def_maxtime_cell_float('cumprcp', map_file%cumprcp_varid, 'm', 'Cumulative precipitation depth', &
            standard_name='cumulative_precipitation_depth', cell_methods='time: sum')
    endif
@@ -639,11 +738,16 @@ contains
            standard_name='percentage_limiting_timestep')
    endif
    !
-   if (store_cumulative_precipitation .and. infiltration) then
+   if (store_cumulative_precipitation .and. infiltration .and. store_max_on_time) then
+      call def_time_cell_float('cuminf', map_file%cuminf_varid, 'm', 'cumulative_infiltration_depth', cell_methods='time: sum')
+   elseif (store_cumulative_precipitation .and. infiltration) then
       call def_maxtime_cell_float('cuminf', map_file%cuminf_varid, 'm', 'cumulative_infiltration_depth', cell_methods='time: sum')
    endif
    !
-   if (store_cumulative_urban_drainage .and. urban_drainage) then
+   if (store_cumulative_urban_drainage .and. urban_drainage .and. store_max_on_time) then
+      call def_time_cell_float('urban_drainage_cumulative_depth', map_file%cumulative_urbdrain_varid, 'm', &
+           'cumulative_urban_drainage_depth', cell_methods='time: sum')
+   elseif (store_cumulative_urban_drainage .and. urban_drainage) then
       call def_maxtime_cell_float('urban_drainage_cumulative_depth', map_file%cumulative_urbdrain_varid, 'm', &
            'cumulative_urban_drainage_depth', cell_methods='time: sum')
    endif
@@ -1378,6 +1482,11 @@ contains
    !
    NF90(nf90_put_var(map_file%ncid, map_file%time_varid, t, (/ntmapout/)))
    !
+   ! Map records written so far (used to fill the max output on the time axis)
+   !
+   nr_map_records    = max(nr_map_records, ntmapout)
+   t_last_map_record = t
+   !
    ! -------------------------------------------------------
    ! Water level / depth
    ! -------------------------------------------------------
@@ -1514,6 +1623,26 @@ contains
       call compute_pnh_unwrapped(pnh_full)
       call write_cell_var(map_file%ncid, map_file%pnonh_varid, pnh_full, ntmapout)
       deallocate(pnh_full)
+   endif
+   !
+   ! With storemaxontime the cumulative fields are normal map variables
+   !
+   if (store_max_on_time) then
+      !
+      if (store_cumulative_precipitation) then
+         !
+         !$acc update host(cumprcp)
+         !
+         if (infiltration) then
+            !
+            !$acc update host(cuminf)
+            !
+         endif
+         !
+      endif
+      !
+      call ncoutput_write_cumulative(ntmapout)
+      !
    endif
    !
    NF90(nf90_sync(map_file%ncid))
@@ -1745,36 +1874,103 @@ contains
    !
    subroutine ncoutput_update_max(t,ntmaxout)
    !
-   ! Write maximum values to map file (handles both regular and quadtree grids)
+   ! Write maximum values to map file. Without storemaxontime at timemax index ntmaxout.
+   ! With storemaxontime to all map records of the window that ends at t (records not
+   ! filled yet, except a record at t itself, which belongs to the next window unless
+   ! t is tstop), in batches that coincide with the chunks along time.
    !
    ! Input:
-   !   t        : current model time [s since tref]
+   !   t        : current model time = end of the max window [s since tref]
    !   ntmaxout : index of the maximum output time
    !
    ! Called from: write_output (sfincs_output)
    !
    use sfincs_data
+   !
+   implicit none
+   !
+   real*8  :: t
+   integer :: ntmaxout, nt_last, nt, nrec
+   !
+   if (store_max_on_time) then
+      !
+      ! A map record at the window end belongs to the next window, unless this is the last
+      ! window (ending at tstop)
+      !
+      nt_last = nr_map_records
+      !
+      if (abs(t_last_map_record - t) < 1.0e-2 * dtmapout .and. t < t1out - 1.0e-2 * dtmapout) nt_last = nt_last - 1
+      !
+      nt = nr_max_records + 1
+      !
+      do while (nt <= nt_last)
+         !
+         nrec = min(chunk_sm(nsd+1) - mod(nt - 1, chunk_sm(nsd+1)), nt_last - nt + 1)
+         !
+         call ncoutput_write_max_records(t, nt, nrec)
+         !
+         nt = nt + nrec
+         !
+      enddo
+      !
+      nr_max_records     = max(nr_max_records, nt_last)
+      t_max_window_start = t
+      !
+   else
+      !
+      call ncoutput_write_max_records(t, ntmaxout, 1)
+      !
+   endif
+   !
+   end subroutine ncoutput_update_max
+   !
+   !
+   subroutine ncoutput_write_max_records(t, nt, nrec)
+   !
+   ! Write maximum values to map file (handles both regular and quadtree grids), to
+   ! records nt .. nt+nrec-1 of the max time axis (timemax, or time with storemaxontime)
+   !
+   ! Input:
+   !   t    : current model time = end of the max window [s since tref]
+   !   nt   : index of the first record
+   !   nrec : number of records
+   !
+   ! Called from: ncoutput_update_max (sfincs_ncoutput)
+   !
+   use sfincs_data
    use quadtree
-   use sfincs_urban_drainage, only: urban_drainage_cumulative_volume
    !
    implicit none
    !
    real*8                            :: t
-   integer                           :: ntmaxout, nm
-   real*4, dimension(:), allocatable :: hmax_out, hmean, zvolmax_out, wet_mask
-   real*4, dimension(:), allocatable :: urbdrain_depth
+   integer                           :: nt, nrec, nm
+   real*4, dimension(:), allocatable :: hmax_out, hmean, zvolmax_out, wet_mask, twindow
    !
-   ! Scalar time of this max-record (defined only when store_maximum_waterlevel)
-   if (store_maximum_waterlevel) then
-      NF90(nf90_put_var(map_file%ncid, map_file%timemax_varid, t, (/ntmaxout/)))
+   if (store_max_on_time) then
+      !
+      ! Window of these records
+      !
+      allocate(twindow(nrec))
+      twindow = real(t_max_window_start, 4)
+      NF90(nf90_put_var(map_file%ncid, map_file%max_window_start_varid, twindow, (/nt/), (/nrec/)))
+      twindow = real(t, 4)
+      NF90(nf90_put_var(map_file%ncid, map_file%max_window_end_varid, twindow, (/nt/), (/nrec/)))
+      deallocate(twindow)
+      !
+   elseif (store_maximum_waterlevel) then
+      !
+      ! Scalar time of this max-record (defined only when store_maximum_waterlevel)
+      !
+      NF90(nf90_put_var(map_file%ncid, map_file%timemax_varid, t, (/nt/)))
+      !
    endif
    !
    ! Maximum water level
    if (store_maximum_waterlevel) then
       if (subgrid) then
-         call write_cell_var_wet(map_file%ncid, map_file%zsmax_varid, zsmax, subgrid_z_zmin, ntmaxout)
+         call write_cell_var_wet(map_file%ncid, map_file%zsmax_varid, zsmax, subgrid_z_zmin, nt, nrec=nrec)
       else
-         call write_cell_var_wet(map_file%ncid, map_file%zsmax_varid, zsmax, zb,             ntmaxout)
+         call write_cell_var_wet(map_file%ncid, map_file%zsmax_varid, zsmax, zb,             nt, nrec=nrec)
       endif
    endif
    !
@@ -1787,7 +1983,7 @@ contains
             zvolmax_out(nm) = zvolmax(nm)
          endif
       enddo
-      call write_cell_var(map_file%ncid, map_file%zvolmax_varid, zvolmax_out, ntmaxout, check_kcs=.true.)
+      call write_cell_var(map_file%ncid, map_file%zvolmax_varid, zvolmax_out, nt, nrec=nrec, check_kcs=.true.)
       deallocate(zvolmax_out)
    endif
    !
@@ -1808,40 +2004,24 @@ contains
             endif
          enddo
          !
-         call write_cell_var(map_file%ncid, map_file%hmax_varid, hmax_out, ntmaxout, check_kcs=.true.)
+         call write_cell_var(map_file%ncid, map_file%hmax_varid, hmax_out, nt, nrec=nrec, check_kcs=.true.)
          !
          deallocate(hmax_out)
          deallocate(hmean)
          !
       elseif (subgrid) then
-         call write_cell_var_depth(map_file%ncid, map_file%hmax_varid, zsmax, subgrid_z_zmin, ntmaxout)
+         call write_cell_var_depth(map_file%ncid, map_file%hmax_varid, zsmax, subgrid_z_zmin, nt, nrec=nrec)
       else
-         call write_cell_var_depth(map_file%ncid, map_file%hmax_varid, zsmax, zb,             ntmaxout)
+         call write_cell_var_depth(map_file%ncid, map_file%hmax_varid, zsmax, zb,             nt, nrec=nrec)
       endif
    endif
    !
-   ! Cumulative rainfall (always when store_cumulative_precipitation) and
-   ! cumulative infiltration (only when infiltration is on — same gate as the def)
-   if (store_cumulative_precipitation) then
-      call write_cell_var(map_file%ncid, map_file%cumprcp_varid, cumprcp, ntmaxout, check_kcs=.true.)
-      if (infiltration) then
-         call write_cell_var(map_file%ncid, map_file%cuminf_varid, cuminf, ntmaxout, check_kcs=.true.)
-      endif
-   endif
+   ! Cumulative fields (with storemaxontime written with the map output instead)
    !
-   ! Cumulative urban drainage depth (drained volume / cell area)
-   if (store_cumulative_urban_drainage .and. urban_drainage) then
-      !$acc update host(urban_drainage_cumulative_volume)
-      allocate(urbdrain_depth(np))
-      do nm = 1, np
-         if (crsgeo) then
-            urbdrain_depth(nm) = urban_drainage_cumulative_volume(nm) / cell_area_m2(nm)
-         else
-            urbdrain_depth(nm) = urban_drainage_cumulative_volume(nm) / cell_area(z_flags_iref(nm))
-         endif
-      enddo
-      call write_cell_var(map_file%ncid, map_file%cumulative_urbdrain_varid, urbdrain_depth, ntmaxout)
-      deallocate(urbdrain_depth)
+   if (.not. store_max_on_time) then
+      !
+      call ncoutput_write_cumulative(nt)
+      !
    endif
    !
    ! Maximum flow velocity / flux
@@ -1866,10 +2046,10 @@ contains
       endif
       !
       if (store_maximum_velocity) then
-         call write_cell_var(map_file%ncid, map_file%vmax_varid, vmax, ntmaxout, check_kcs=.true., mask=wet_mask)
+         call write_cell_var(map_file%ncid, map_file%vmax_varid, vmax, nt, nrec=nrec, check_kcs=.true., mask=wet_mask)
       endif
       if (store_maximum_flux) then
-         call write_cell_var(map_file%ncid, map_file%qmax_varid, qmax, ntmaxout, check_kcs=.true., mask=wet_mask)
+         call write_cell_var(map_file%ncid, map_file%qmax_varid, qmax, nt, nrec=nrec, check_kcs=.true., mask=wet_mask)
       endif
       !
       deallocate(wet_mask)
@@ -1878,22 +2058,68 @@ contains
    !
    ! Duration wet cell
    if (store_twet) then
-      call write_cell_var(map_file%ncid, map_file%tmax_varid, twet, ntmaxout, check_kcs=.true.)
+      call write_cell_var(map_file%ncid, map_file%tmax_varid, twet, nt, nrec=nrec, check_kcs=.true.)
    endif
    !
    ! When zsmax occurred (only cells where it actually happened, i.e. t_zsmax > 0)
    if (store_t_zsmax) then
-      call write_cell_var(map_file%ncid, map_file%t_zsmax_varid, t_zsmax, ntmaxout, &
+      call write_cell_var(map_file%ncid, map_file%t_zsmax_varid, t_zsmax, nt, nrec=nrec, &
            check_kcs=.true., min_value=0.0)
    endif
    !
    ! Maximum wind speed (def is gated on store_meteo .and. wind .and.
    ! store_wind_max .and. meteo3d in ncoutput_map_init; mirror that here)
    if (store_meteo .and. wind .and. store_wind_max .and. meteo3d) then
-      call write_cell_var(map_file%ncid, map_file%windmax_varid, windmax, ntmaxout, check_kcs=.true.)
+      call write_cell_var(map_file%ncid, map_file%windmax_varid, windmax, nt, nrec=nrec, check_kcs=.true.)
    endif
    !
-   end subroutine ncoutput_update_max
+   end subroutine ncoutput_write_max_records
+   !
+   !
+   subroutine ncoutput_write_cumulative(nt)
+   !
+   ! Write the cumulative precipitation, infiltration and urban drainage depth (all
+   ! cumulative since the start of the simulation) at record nt
+   !
+   ! Input:
+   !   nt : index of the output time (timemax, or time with storemaxontime)
+   !
+   ! Called from: ncoutput_update_map, ncoutput_write_max_records (sfincs_ncoutput)
+   !
+   use sfincs_data
+   use quadtree
+   use sfincs_urban_drainage, only: urban_drainage_cumulative_volume
+   !
+   implicit none
+   !
+   integer                           :: nt, nm
+   real*4, dimension(:), allocatable :: urbdrain_depth
+   !
+   ! Cumulative rainfall (always when store_cumulative_precipitation) and
+   ! cumulative infiltration (only when infiltration is on — same gate as the def)
+   if (store_cumulative_precipitation) then
+      call write_cell_var(map_file%ncid, map_file%cumprcp_varid, cumprcp, nt, check_kcs=.true.)
+      if (infiltration) then
+         call write_cell_var(map_file%ncid, map_file%cuminf_varid, cuminf, nt, check_kcs=.true.)
+      endif
+   endif
+   !
+   ! Cumulative urban drainage depth (drained volume / cell area)
+   if (store_cumulative_urban_drainage .and. urban_drainage) then
+      !$acc update host(urban_drainage_cumulative_volume)
+      allocate(urbdrain_depth(np))
+      do nm = 1, np
+         if (crsgeo) then
+            urbdrain_depth(nm) = urban_drainage_cumulative_volume(nm) / cell_area_m2(nm)
+         else
+            urbdrain_depth(nm) = urban_drainage_cumulative_volume(nm) / cell_area(z_flags_iref(nm))
+         endif
+      enddo
+      call write_cell_var(map_file%ncid, map_file%cumulative_urbdrain_varid, urbdrain_depth, nt)
+      deallocate(urbdrain_depth)
+   endif
+   !
+   end subroutine ncoutput_write_cumulative
 
    subroutine ncoutput_map_finalize() 
    !
@@ -1918,6 +2144,12 @@ contains
        !
    endif
    !
+   if (store_max_on_time) then
+      !
+      call ncoutput_fill_last_max_records()
+      !
+   endif
+   !
    NF90(nf90_put_var(map_file%ncid, map_file%total_runtime_varid, real(timer_elapsed('simulation'), 4)))
    NF90(nf90_put_var(map_file%ncid, map_file%average_dt_varid,  dtavg))
    NF90(nf90_put_var(map_file%ncid, map_file%status_varid,  error))
@@ -1925,6 +2157,49 @@ contains
    NF90(nf90_close(map_file%ncid))
    !
    end subroutine ncoutput_map_finalize
+   !
+   !
+   subroutine ncoutput_fill_last_max_records()
+   !
+   ! With storemaxontime: map records after the last window (the record at tstop, or after
+   ! a 'dtmin' stop) get the maximum of the last window
+   !
+   ! Called from: ncoutput_map_finalize (sfincs_ncoutput)
+   !
+   use sfincs_data
+   !
+   implicit none
+   !
+   integer :: nt, nrec, ivar
+   real*4  :: tw(1)
+   real*4, dimension(:), allocatable :: twindow
+   !
+   if (nr_max_records >= 1 .and. nr_max_records < nr_map_records) then
+      !
+      nt   = nr_max_records + 1
+      nrec = nr_map_records - nr_max_records
+      !
+      do ivar = 1, nr_maxtime_vars
+         !
+         call copy_cell_record(map_file%ncid, maxtime_varids(ivar), nr_max_records, nt, nrec)
+         !
+      enddo
+      !
+      allocate(twindow(nrec))
+      !
+      NF90(nf90_get_var(map_file%ncid, map_file%max_window_start_varid, tw, (/nr_max_records/), (/1/)))
+      twindow = tw(1)
+      NF90(nf90_put_var(map_file%ncid, map_file%max_window_start_varid, twindow, (/nt/), (/nrec/)))
+      !
+      NF90(nf90_get_var(map_file%ncid, map_file%max_window_end_varid, tw, (/nr_max_records/), (/1/)))
+      twindow = tw(1)
+      NF90(nf90_put_var(map_file%ncid, map_file%max_window_end_varid, twindow, (/nt/), (/nrec/)))
+      !
+      nr_max_records = nr_map_records
+      !
+   endif
+   !
+   end subroutine ncoutput_fill_last_max_records
    !
    !
    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -2167,6 +2442,7 @@ contains
         NF90(nf90_put_att(ncid, varid, 'tsunami_arrival_threshold',tsunami_arrival_threshold))
         NF90(nf90_put_att(ncid, varid, 'storezvolume',logical2int(store_zvolume)))
         NF90(nf90_put_att(ncid, varid, 'storezvolmax',logical2int(store_zvolume_max)))
+        NF90(nf90_put_att(ncid, varid, 'storemaxontime',logical2int(store_max_on_time)))
         NF90(nf90_put_att(ncid, varid, 'writeruntime',logical2int(write_time_output)))
         NF90(nf90_put_att(ncid, varid, 'debug',logical2int(debug)))
         NF90(nf90_put_att(ncid, varid, 'storemeteo',logical2int(store_meteo)))

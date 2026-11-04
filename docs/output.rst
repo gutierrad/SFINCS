@@ -289,9 +289,12 @@ For a quadtree model (see :ref:`quadtree`), the cell centre coordinates are 'mes
 	  :standard_name:	storage_volume_in_cell	  
 	  :units:		m^3	  
 	timemax
-	  :description:		Time of global map output per 'dtmaxout' timestep.
+	  :description:		Time of global map output per 'dtmaxout' timestep (end of each window). Not written with 'storemaxontime = 1': the maximum output is then on the 'time' axis, where each map time holds the maximum over the 'dtmaxout' window containing it.
 	  :standard_name:	time	  
 	  :units:		seconds since 'tref'	  
+	max_window_start, max_window_end
+	  :description:		Only with 'storemaxontime = 1': start and end of the 'dtmaxout' window whose maximum is stored at each map time. A map time at a window end belongs to the next window, except 'tstop', which belongs to the last window. After a 'dtmin' stop, the last map time gets the last window.
+	  :units:		seconds since 'tref'
 	zsmax
 	  :description:		Maximum water level per 'dtmaxout' timestep, only given if dtmaxout>0, corresponding with netcdf variable 'timemax'.
 	  :standard_name:	maximum of sea_surface_height_above_mean_sea_level

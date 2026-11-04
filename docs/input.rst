@@ -854,6 +854,8 @@ If 'tref' is not specified, it is set to 'tstart'. All times in the input and ou
 Also the output date interval can be controlled.
 For the map output there is data output every 'dtmapout' seconds (the old keyword 'dtout' is still accepted), for optional observation points this is 'dthisout' seconds.
 It also possible to get the maximum output data over a specific interval (e.g. every day), specify using 'dtmaxout' in seconds.
+By default the maximum output is written on its own time axis 'timemax', with the end time of each window.
+With 'storemaxontime = 1' it is written on the map time axis instead: each map time gets the maximum over the 'dtmaxout' window that contains it (see 'Output description').
 When using a spiderweb-file for the wind input, the values are updated every 'dtwnd' seconds.
 
 .. code-block:: text

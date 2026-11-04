@@ -266,6 +266,7 @@ module sfincs_data
       logical       :: urban_drainage
       logical       :: store_urban_drainage_discharge
       logical       :: store_cumulative_urban_drainage
+      logical       :: store_max_on_time
       LOGICAL       :: netcdf_infiltration
       logical       :: debug
       logical       :: radstr

@@ -535,6 +535,10 @@ Parameters for model output
 	  :description:		Flag to turn on writing away the maximum water volume 'zvolmax' in subgrid cells on 'dtmaxout' interval during simulation (storezvolmax = 1). Used for improved downscaling of flood maps. Only for subgrid models, and only if dtmaxout > 0.
 	  :units:		-
 	  :default:		1
+	storemaxontime
+	  :description:		Flag to write the maximum output (zsmax, hmax, vmax, qmax, tmax, zvolmax, t_zsmax, windmax) on the map 'time' axis instead of the separate 'timemax' axis (storemaxontime = 1). Each map time gets the maximum over the 'dtmaxout' window that contains it (windows start at the start of the output), and the variables 'max_window_start' and 'max_window_end' give that window. The cumulative fields (cumprcp, cuminf, urban_drainage_cumulative_depth) are then written at every map time. Requires dtmapout > 0 and dtmaxout > 0; dtmaxout should be a multiple of dtmapout, so that the repeated window maxima are compressed together (otherwise the file becomes larger).
+	  :units:		-
+	  :default:		0
 	storestoragevolume
 	  :description:		Flag to turn on writing away storage volumes for the subgrid mode during simulation (storestoragevolume = 1)
 	  :units:		-

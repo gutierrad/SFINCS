@@ -309,6 +309,7 @@ contains
       call get_keyword(500, 'timestep_analysis',               timestep_analysis,               .false.)           ! write per-cell timestep limiter diagnostics
       call get_keyword(500, 'storezvolume',                    store_zvolume,                   .false.)           ! store subgrid cell volume on dtmapout interval (requires subgrid)
       call get_keyword(500, 'storezvolmax',                    store_zvolume_max,               .true.)            ! store maximum subgrid cell volume on dtmaxout interval (requires subgrid)
+      call get_keyword(500, 'storemaxontime',                  store_max_on_time,               .false.)           ! write max output on the map time axis (value = max of the dtmaxout window containing each map time)
       call get_keyword(500, 'storestoragevolume',              store_storagevolume,             .false.)           ! store remaining storage volume (requires subgrid + volfile)
       call get_keyword(500, 'writeruntime',                    write_time_output,               .false.)           ! write runtimes.txt at end of simulation
       call get_keyword(500, 'debug',                           debug,                           .false.)           ! debug output at every time step
@@ -476,6 +477,15 @@ contains
          store_maximum_velocity   = .false.
          store_maximum_flux       = .false.
          store_zvolume_max        = .false.
+         !
+      endif
+      !
+      ! Max output on the map time axis needs both map and max output
+      !
+      if (store_max_on_time .and. (dtmapout <= 0.0 .or. .not. store_maximum_waterlevel)) then
+         !
+         call write_log('Warning : storemaxontime requires dtmapout > 0 and dtmaxout > 0, max output is written on timemax', 1)
+         store_max_on_time = .false.
          !
       endif
       !

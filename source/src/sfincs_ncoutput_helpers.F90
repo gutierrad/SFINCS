@@ -38,19 +38,35 @@ module sfincs_ncoutput_helpers
    ! Subroutines / functions:
    !
    !   write_cell_var(...)
-   !     Write a cell-centred variable to the map file at time index nt.
+   !     Write a cell-centred variable to the map file at time index nt (optionally the same
+   !     field to nrec consecutive records).
    !     Called from: ncoutput_update_map (sfincs_ncoutput),
-   !       ncoutput_update_max (sfincs_ncoutput)
+   !       ncoutput_write_max_records (sfincs_ncoutput),
+   !       ncoutput_write_cumulative (sfincs_ncoutput)
    !
-   !   write_cell_var_wet(ncid, varid, source, zref, nt, check_wet)
+   !   write_cell_var_wet(ncid, varid, source, zref, nt, check_wet, nrec)
    !     Write a cell-centred variable to the map file, in wet cells only.
    !     Called from: ncoutput_update_map (sfincs_ncoutput),
-   !       ncoutput_update_max (sfincs_ncoutput)
+   !       ncoutput_write_max_records (sfincs_ncoutput)
    !
-   !   write_cell_var_depth(ncid, varid, water_level, bed_level, nt, check_wet)
+   !   write_cell_var_depth(ncid, varid, water_level, bed_level, nt, check_wet, nrec)
    !     Write the water depth to the map file, in wet cells only.
    !     Called from: ncoutput_update_map (sfincs_ncoutput),
-   !       ncoutput_update_max (sfincs_ncoutput)
+   !       ncoutput_write_max_records (sfincs_ncoutput)
+   !
+   !   put_cell_records_q(ncid, varid, buf, nt, nrec)
+   !     Write a quadtree-shaped cell buffer to nrec consecutive records, starting at nt.
+   !     Called from: write_cell_var, write_cell_var_wet, write_cell_var_depth,
+   !       copy_cell_record (sfincs_ncoutput_helpers)
+   !
+   !   put_cell_records_r(ncid, varid, buf, nt, nrec)
+   !     Write a regular-grid cell buffer to nrec consecutive records, starting at nt.
+   !     Called from: write_cell_var, write_cell_var_wet, write_cell_var_depth,
+   !       copy_cell_record (sfincs_ncoutput_helpers)
+   !
+   !   copy_cell_record(ncid, varid, nt_src, nt, nrec)
+   !     Copy record nt_src of a cell variable to nrec consecutive records, starting at nt.
+   !     Called from: ncoutput_fill_last_max_records (sfincs_ncoutput)
    !
    !   put_static_cell_float(ncid, varid, source, fill, scale, sw_index, min_value)
    !     Write a static (time-independent) real cell variable to the map file.
@@ -83,7 +99,8 @@ module sfincs_ncoutput_helpers
    !     Called from: ncoutput_map_init (sfincs_ncoutput)
    !
    !   def_maxtime_cell_float(...)
-   !     Define a real cell variable on the maximum-output time axis in the map file.
+   !     Define a real cell variable on the maximum-output time axis in the map file
+   !     (timemax, or time with window-deep chunks when storemaxontime = 1).
    !     Called from: ncoutput_map_init (sfincs_ncoutput)
    !
    !   add_ugrid_face_attrs(varid)
@@ -211,6 +228,7 @@ module sfincs_ncoutput_helpers
       integer :: corner_x_varid, corner_y_varid, face_x_varid, face_y_varid, crs_varid, grid_varid
       integer :: zb_varid, msk_varid, qinf_varid
       integer :: time_varid, timemax_varid
+      integer :: max_window_start_varid, max_window_end_varid
       integer :: zs_varid, zsmax_varid, zvolmax_varid, h_varid, u_varid, v_varid, tmax_varid, infstate_varid, t_zsmax_varid
       integer :: zvolume_varid, storagevolume_varid
       integer :: hmax_varid, vmax_varid, qmax_varid, cumprcp_varid, cuminf_varid, windmax_varid
@@ -278,6 +296,18 @@ module sfincs_ncoutput_helpers
    integer      :: nsd
    integer      :: dims_s(3), dims_st(3), dims_sm(3)
    character(4) :: coord_str
+   !
+   ! Max output on the map time axis (storemaxontime = 1), set by ncoutput_map_init:
+   ! chunk sizes of the max variables (window-deep along time), the max variables that
+   ! are copied into the trailing records at the end, and the bookkeeping of the map
+   ! records written and the records already filled with a window maximum.
+   integer      :: chunk_sm(3)
+   integer      :: nr_maxtime_vars = 0
+   integer      :: maxtime_varids(16)
+   integer      :: nr_map_records  = 0
+   integer      :: nr_max_records  = 0
+   real*8       :: t_last_map_record
+   real*8       :: t_max_window_start
 
 contains
 
@@ -291,10 +321,11 @@ contains
    !
    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-   subroutine write_cell_var(ncid, varid, source, nt, use_sw_index, check_kcs, scale, min_value, mask)
+   subroutine write_cell_var(ncid, varid, source, nt, use_sw_index, check_kcs, scale, min_value, mask, nrec)
       !
       ! Scatter SFINCS cell-centered source(:) into the file-shaped buffer
       ! and put it to the NetCDF variable at timestep nt.
+      !   nrec                -> write the same field to records nt .. nt+nrec-1 (default 1)
       !   use_sw_index=.true. -> quadtree gather uses index_sw_in_qt (snapwave)
       !   check_kcs=.true.    -> quadtree skips cells with kcs<=0 (max-file style)
       !   scale               -> multiply source by scale on write (unit conversions)
@@ -315,12 +346,14 @@ contains
       logical, intent(in), optional :: use_sw_index, check_kcs
       real*4,  intent(in), optional :: scale, min_value
       real*4,  intent(in), optional :: mask(:)
+      integer, intent(in), optional :: nrec
       !
       real*4,  allocatable :: buf_q(:), buf_r(:,:)
       logical :: use_sw, filt_kcs, filt_min, filt_mask
       real*4  :: fac, vmin
-      integer :: nm, nmq, nms
+      integer :: nm, nmq, nms, nr
       !
+      nr        = 1;       if (present(nrec))         nr        = nrec
       use_sw    = .false.; if (present(use_sw_index)) use_sw    = use_sw_index
       filt_kcs  = .false.; if (present(check_kcs))    filt_kcs  = check_kcs
       filt_min  = .false.; if (present(min_value))    filt_min  = .true.
@@ -345,7 +378,7 @@ contains
             endif
             buf_q(nmq) = fac * source(nm)
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_q, (/1, nt/)))
+         call put_cell_records_q(ncid, varid, buf_q, nt, nr)
       else
          allocate(buf_r(mmax, nmax))
          buf_r = FILL_VALUE
@@ -363,11 +396,11 @@ contains
             endif
             buf_r(z_index_z_m(nm), z_index_z_n(nm)) = fac * source(nms)
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_r, (/1, 1, nt/)))
+         call put_cell_records_r(ncid, varid, buf_r, nt, nr)
       endif
    end subroutine write_cell_var
 
-   subroutine write_cell_var_wet(ncid, varid, source, zref, nt, check_wet)
+   subroutine write_cell_var_wet(ncid, varid, source, zref, nt, check_wet, nrec)
       !
       ! Wet-cell filtered writer for a cell variable (e.g. zs / zsmax).
       ! On quadtree: skips kcs<=0 cells. On both grids: when check_wet (default
@@ -382,9 +415,10 @@ contains
       !               [m]
       !   nt        : index of the output time
       !   check_wet : only write wet cells (default: true)
+      !   nrec      : write the same field to records nt .. nt+nrec-1 (default: 1)
       !
       ! Called from: ncoutput_update_map (sfincs_ncoutput),
-      !   ncoutput_update_max (sfincs_ncoutput)
+      !   ncoutput_write_max_records (sfincs_ncoutput)
       !
       use sfincs_data
       use quadtree
@@ -392,12 +426,14 @@ contains
       integer, intent(in)           :: ncid, varid, nt
       real*4,  intent(in)           :: source(:), zref(:)
       logical, intent(in), optional :: check_wet
+      integer, intent(in), optional :: nrec
       !
       real*4,  allocatable :: buf_q(:), buf_r(:,:)
       logical :: filt_wet
-      integer :: nm, nmq
+      integer :: nm, nmq, nr
       !
       filt_wet = .true.; if (present(check_wet)) filt_wet = check_wet
+      nr       = 1;      if (present(nrec))      nr       = nrec
       !
       if (use_quadtree) then
          allocate(buf_q(quadtree_nr_points))
@@ -412,7 +448,7 @@ contains
                endif
             endif
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_q, (/1, nt/)))
+         call put_cell_records_q(ncid, varid, buf_q, nt, nr)
       else
          allocate(buf_r(mmax, nmax))
          buf_r = FILL_VALUE
@@ -421,11 +457,11 @@ contains
                buf_r(z_index_z_m(nm), z_index_z_n(nm)) = source(nm)
             endif
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_r, (/1, 1, nt/)))
+         call put_cell_records_r(ncid, varid, buf_r, nt, nr)
       endif
    end subroutine write_cell_var_wet
 
-   subroutine write_cell_var_depth(ncid, varid, water_level, bed_level, nt, check_wet)
+   subroutine write_cell_var_depth(ncid, varid, water_level, bed_level, nt, check_wet, nrec)
       !
       ! Wet-cell filtered writer for the water depth (h).
       ! Writes depth = water_level - bed_level, only in cells that are wet, i.e.
@@ -440,9 +476,10 @@ contains
       !   bed_level   : bed level per cell [m]
       !   nt          : index of the output time
       !   check_wet   : only write wet cells (default: true)
+      !   nrec        : write the same field to records nt .. nt+nrec-1 (default: 1)
       !
       ! Called from: ncoutput_update_map (sfincs_ncoutput),
-      !   ncoutput_update_max (sfincs_ncoutput)
+      !   ncoutput_write_max_records (sfincs_ncoutput)
       !
       use sfincs_data
       use quadtree
@@ -450,13 +487,15 @@ contains
       integer, intent(in)           :: ncid, varid, nt
       real*4,  intent(in)           :: water_level(:), bed_level(:)
       logical, intent(in), optional :: check_wet
+      integer, intent(in), optional :: nrec
       !
       real*4,  allocatable :: buf_q(:), buf_r(:,:)
       logical :: filt_wet
-      integer :: nm, nmq
+      integer :: nm, nmq, nr
       real*4  :: depth
       !
       filt_wet = .true.; if (present(check_wet)) filt_wet = check_wet
+      nr       = 1;      if (present(nrec))      nr       = nrec
       !
       if (use_quadtree) then
          allocate(buf_q(quadtree_nr_points))
@@ -472,7 +511,7 @@ contains
                endif
             endif
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_q, (/1, nt/)))
+         call put_cell_records_q(ncid, varid, buf_q, nt, nr)
       else
          allocate(buf_r(mmax, nmax))
          buf_r = FILL_VALUE
@@ -482,9 +521,127 @@ contains
                buf_r(z_index_z_m(nm), z_index_z_n(nm)) = depth
             endif
          enddo
-         NF90(nf90_put_var(ncid, varid, buf_r, (/1, 1, nt/)))
+         call put_cell_records_r(ncid, varid, buf_r, nt, nr)
       endif
    end subroutine write_cell_var_depth
+
+   subroutine put_cell_records_q(ncid, varid, buf, nt, nrec)
+      !
+      ! Write a quadtree-shaped cell buffer to records nt .. nt+nrec-1 in one call, so that
+      ! a chunk spanning these records is written (and compressed) only once.
+      !
+      ! Input:
+      !   ncid  : netCDF file id
+      !   varid : netCDF variable id
+      !   buf   : values per quadtree cell
+      !   nt    : index of the first output time
+      !   nrec  : number of records
+      !
+      ! Called from: write_cell_var, write_cell_var_wet, write_cell_var_depth,
+      !   copy_cell_record (sfincs_ncoutput_helpers)
+      !
+      integer, intent(in) :: ncid, varid, nt, nrec
+      real*4,  intent(in) :: buf(:)
+      !
+      real*4, allocatable :: buf_t(:,:)
+      integer :: irec
+      !
+      if (nrec <= 1) then
+         !
+         NF90(nf90_put_var(ncid, varid, buf, (/1, nt/)))
+         !
+      else
+         !
+         allocate(buf_t(size(buf), nrec))
+         !
+         do irec = 1, nrec
+            !
+            buf_t(:, irec) = buf
+            !
+         enddo
+         !
+         NF90(nf90_put_var(ncid, varid, buf_t, (/1, nt/), (/size(buf), nrec/)))
+         !
+      endif
+      !
+   end subroutine put_cell_records_q
+
+   subroutine put_cell_records_r(ncid, varid, buf, nt, nrec)
+      !
+      ! Write a regular-grid cell buffer (m, n) to records nt .. nt+nrec-1 in one call, so
+      ! that a chunk spanning these records is written (and compressed) only once.
+      !
+      ! Input:
+      !   ncid  : netCDF file id
+      !   varid : netCDF variable id
+      !   buf   : values per grid cell (m, n)
+      !   nt    : index of the first output time
+      !   nrec  : number of records
+      !
+      ! Called from: write_cell_var, write_cell_var_wet, write_cell_var_depth,
+      !   copy_cell_record (sfincs_ncoutput_helpers)
+      !
+      integer, intent(in) :: ncid, varid, nt, nrec
+      real*4,  intent(in) :: buf(:,:)
+      !
+      real*4, allocatable :: buf_t(:,:,:)
+      integer :: irec
+      !
+      if (nrec <= 1) then
+         !
+         NF90(nf90_put_var(ncid, varid, buf, (/1, 1, nt/)))
+         !
+      else
+         !
+         allocate(buf_t(size(buf, 1), size(buf, 2), nrec))
+         !
+         do irec = 1, nrec
+            !
+            buf_t(:, :, irec) = buf
+            !
+         enddo
+         !
+         NF90(nf90_put_var(ncid, varid, buf_t, (/1, 1, nt/), (/size(buf, 1), size(buf, 2), nrec/)))
+         !
+      endif
+      !
+   end subroutine put_cell_records_r
+
+   subroutine copy_cell_record(ncid, varid, nt_src, nt, nrec)
+      !
+      ! Copy record nt_src of a cell variable to records nt .. nt+nrec-1.
+      !
+      ! Input:
+      !   ncid   : netCDF file id
+      !   varid  : netCDF variable id
+      !   nt_src : index of the record to copy
+      !   nt     : index of the first output time
+      !   nrec   : number of records
+      !
+      ! Called from: ncoutput_fill_last_max_records (sfincs_ncoutput)
+      !
+      use sfincs_data
+      use quadtree
+      !
+      integer, intent(in) :: ncid, varid, nt_src, nt, nrec
+      !
+      real*4, allocatable :: buf_q(:), buf_r(:,:)
+      !
+      if (use_quadtree) then
+         !
+         allocate(buf_q(quadtree_nr_points))
+         NF90(nf90_get_var(ncid, varid, buf_q, (/1, nt_src/), (/quadtree_nr_points, 1/)))
+         call put_cell_records_q(ncid, varid, buf_q, nt, nrec)
+         !
+      else
+         !
+         allocate(buf_r(mmax, nmax))
+         NF90(nf90_get_var(ncid, varid, buf_r, (/1, 1, nt_src/), (/mmax, nmax, 1/)))
+         call put_cell_records_r(ncid, varid, buf_r, nt, nrec)
+         !
+      endif
+      !
+   end subroutine copy_cell_record
 
    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
    !
@@ -841,7 +998,9 @@ contains
    subroutine def_maxtime_cell_float(name, varid, units, long_name, &
                                       standard_name, cell_methods, description)
       !
-      ! Define a real cell variable on the maximum-output time axis in the map file.
+      ! Define a real cell variable on the maximum-output time axis in the map file:
+      ! timemax, or (storemaxontime = 1) time with window-deep chunks (chunk_sm), so that
+      ! the identical copies of a window maximum are compressed together.
       !
       ! Input:
       !   name          : name of the netCDF variable
@@ -856,15 +1015,29 @@ contains
       !
       ! Called from: ncoutput_map_init (sfincs_ncoutput)
       !
-      use sfincs_data, only: nc_deflate_level
+      use sfincs_data, only: nc_deflate_level, store_max_on_time
       character(*), intent(in)           :: name
       integer,      intent(out)          :: varid
       character(*), intent(in)           :: units, long_name
       character(*), intent(in), optional :: standard_name, cell_methods, description
-      call ncdef_float_var(map_file%ncid, name, dims_sm(1:nsd+1), varid, units, long_name, &
-           standard_name=standard_name, coordinates=coord_str,                             &
-           cell_methods=cell_methods, description=description,                             &
-           deflate_level=nc_deflate_level)
+      if (store_max_on_time) then
+         !
+         call ncdef_float_var(map_file%ncid, name, dims_sm(1:nsd+1), varid, units, long_name, &
+              standard_name=standard_name, coordinates=coord_str,                             &
+              cell_methods=cell_methods, description=description,                             &
+              deflate_level=nc_deflate_level, chunksizes=chunk_sm(1:nsd+1))
+         !
+         nr_maxtime_vars                 = nr_maxtime_vars + 1
+         maxtime_varids(nr_maxtime_vars) = varid
+         !
+      else
+         !
+         call ncdef_float_var(map_file%ncid, name, dims_sm(1:nsd+1), varid, units, long_name, &
+              standard_name=standard_name, coordinates=coord_str,                             &
+              cell_methods=cell_methods, description=description,                             &
+              deflate_level=nc_deflate_level)
+         !
+      endif
       call add_ugrid_face_attrs(varid)
    end subroutine def_maxtime_cell_float
 
@@ -1385,7 +1558,7 @@ contains
                                units, long_name,             &
                                standard_name, coordinates,   &
                                cell_methods, description,    &
-                               deflate_level)
+                               deflate_level, chunksizes)
       !
       ! Define a NF90_FLOAT variable and set standard attributes in one call.
       ! Optional attributes are only written when present and non-empty.
@@ -1401,6 +1574,7 @@ contains
       !   cell_methods  : CF cell_methods attribute (optional)
       !   description   : description attribute (optional)
       !   deflate_level : compression level (default: 6)
+      !   chunksizes    : chunk sizes (optional, default netCDF chunking)
       !
       ! Output:
       !   varid         : id of the new netCDF variable
@@ -1424,6 +1598,7 @@ contains
       character(*), intent(in), optional :: cell_methods
       character(*), intent(in), optional :: description
       integer,      intent(in), optional :: deflate_level
+      integer,      intent(in), optional :: chunksizes(:)
       !
       integer :: nc_deflate
       !
@@ -1431,6 +1606,9 @@ contains
       if (present(deflate_level)) nc_deflate = deflate_level
       !
       NF90(nf90_def_var(ncid, trim(varname), NF90_FLOAT, dimids, varid))
+      if (present(chunksizes)) then
+         NF90(nf90_def_var_chunking(ncid, varid, NF90_CHUNKED, chunksizes))
+      endif
       NF90(nf90_def_var_deflate(ncid, varid, 1, 1, nc_deflate))
       NF90(nf90_put_att(ncid, varid, '_FillValue', FILL_VALUE))
       NF90(nf90_put_att(ncid, varid, 'units', trim(units)))
