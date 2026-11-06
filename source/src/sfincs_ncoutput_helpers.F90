@@ -861,10 +861,20 @@ contains
       integer,      intent(out)          :: varid
       character(*), intent(in)           :: units, long_name
       character(*), intent(in), optional :: standard_name, cell_methods, description
+      integer :: contiguous, chunks(3)
       call ncdef_float_var(map_file%ncid, name, dims_sm(1:nsd+1), varid, units, long_name, &
            standard_name=standard_name, coordinates=coord_str,                             &
            cell_methods=cell_methods, description=description,                             &
            deflate_level=nc_deflate_level)
+      !
+      ! One max-output window per chunk. timemax has a fixed length, so the default chunks
+      ! hold several windows, and every max output would rewrite (and recompress) a chunk;
+      ! HDF5 does not reuse the space of the old chunk. Keep the default spatial chunk sizes.
+      !
+      NF90(nf90_inq_var_chunking(map_file%ncid, varid, contiguous, chunks(1:nsd+1)))
+      chunks(nsd+1) = 1
+      NF90(nf90_def_var_chunking(map_file%ncid, varid, NF90_CHUNKED, chunks(1:nsd+1)))
+      !
       call add_ugrid_face_attrs(varid)
    end subroutine def_maxtime_cell_float
 
